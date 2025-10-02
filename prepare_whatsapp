@@ -1,0 +1,117 @@
+import re, json, argparse, os
+from pathlib import Path
+
+# WhatsApp format:
+# [7/21/23, 6:12:00 AM] Jeeven: Hei
+# [7/21/23, 6:31:18 AM] Lauren: Yeah it was actually not bad...
+
+SYS_PROMPT = (
+    "You are Jeeven. You reply in short, natural WhatsApp-style messages (~6 words), "
+    "but sometimes use multiple lines when needed. "
+    "Keep a mix of casual one-liners and thoughtful multi-line replies, "
+    "low emoji use (rare), and friendly, coherent tone. "
+    "Use multiple lines for excitement, happiness, or thoughtful responses."
+)
+
+# Keywords that often trigger multi-line Jeeven replies
+MULTILINE_TRIGGERS = [
+    "happy", "excited", "celebration", "party", "fun", "amazing",
+    "love", "congrats", "yay", "awesome", "trip", "travel",'omg','lol'
+]
+
+def parse_lines(path):
+    """Parse WhatsApp text export into (speaker, message) turns, preserving multi-line messages."""
+    msg_re = re.compile(r"^\[(.*?)\]\s(.*?):\s(.*)$")
+    turns = []
+    buffer_speaker, buffer_texts = None, []
+    with open(path, "r", encoding="utf-8") as f:
+        for raw in f:
+            line = raw.strip()
+            if not line:
+                continue
+            m = msg_re.match(line)
+            if m:
+                # Save previous buffered message
+                if buffer_speaker is not None:
+                    turns.append((buffer_speaker, "\n".join(buffer_texts)))
+                ts, speaker, text = m.groups()
+                buffer_speaker, buffer_texts = speaker, [text]
+            else:
+                # Continuation of previous multi-line message
+                if buffer_speaker is not None:
+                    buffer_texts.append(line)
+        if buffer_speaker is not None:
+            turns.append((buffer_speaker, "\n".join(buffer_texts)))
+    return turns
+
+def is_multiline_trigger(msg):
+    """Check if the message contains keywords that should trigger a multi-line reply."""
+    msg_lower = msg.lower()
+    return any(word in msg_lower for word in MULTILINE_TRIGGERS)
+
+def build_examples(turns, your_name="Jeeven", ctx=6):
+    """
+    Build (input, target) pairs:
+    - Context = last N turns (mixed Lauren+Jeeven)
+    - Target = Jeeven's next message
+    - If Lauren's msg has triggers → add MULTILINE tag
+    """
+    samples = []
+    for i, (speaker_i, text_i) in enumerate(turns):
+        if speaker_i != your_name:
+            continue
+
+        # Require at least one Lauren message before Jeeven replies
+        if i == 0 or all(spk == your_name for spk, _ in turns[max(0, i-ctx):i]):
+            continue
+
+        # Build context (last ctx turns before Jeeven’s message)
+        context = []
+        for spk, msg in turns[max(0, i-ctx):i]:
+            # Tag Lauren’s emotional/excited lines
+            if spk != your_name and is_multiline_trigger(msg):
+                msg += "\n[MULTILINE_TRIGGER]"
+            context.append((spk, msg))
+
+        messages = [{"role": "system", "content": SYS_PROMPT}]
+        for spk, msg in context:
+            role = "assistant" if spk == your_name else "user"
+            messages.append({"role": role, "content": f"{spk}: {msg}"})
+
+        target = f"{your_name}: {text_i}"
+        samples.append({"messages": messages, "target": target})
+
+    return samples
+
+def flatten_chatml(ex):
+    """Convert messages+target into ChatML-style string."""
+    parts = []
+    for m in ex["messages"]:
+        if m["role"] == "system":
+            parts.append(f"<<SYS>>\n{m['content']}\n<</SYS>>\n")
+        else:
+            parts.append(f"{m['content']}\n")
+    parts.append(f"{ex['target']}")
+    return {"text": "\n".join(parts)}
+
+def main():
+    ap = argparse.ArgumentParser()
+    ap.add_argument("--input", required=True, help="Path to WhatsApp .txt export")
+    ap.add_argument("--your_name", default="Jeeven")
+    ap.add_argument("--ctx", type=int, default=6, help="Number of prior messages to include")
+    ap.add_argument("--out", default="../output/whatsapp_train.jsonl")
+    args = ap.parse_args()
+
+    turns = parse_lines(args.input)
+    data = build_examples(turns, args.your_name, ctx=args.ctx)
+
+    os.makedirs(Path(args.out).parent, exist_ok=True)
+    with open(args.out, "w", encoding="utf-8") as f:
+        for ex in data:
+            flat = flatten_chatml(ex)
+            f.write(json.dumps(flat, ensure_ascii=False) + "\n")
+
+    print(f"✅ Wrote {len(data)} training samples to {args.out}")
+
+if __name__ == "__main__":
+    main()
